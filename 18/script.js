@@ -106,7 +106,7 @@ async function main() {
   let numChunks = 1;
   let drawTimer = 0;
 
-  const zMap = createFloatBuffer(4096, 4096);
+  const zMap = createFloatBuffer(size, size);
   const fb = gl.createFramebuffer();
 
   function pause() {
@@ -173,56 +173,55 @@ async function main() {
     draw();
   }
 
-  const computed = getComputedStyle(canvas);
-  console.log(computed);
-  const w = parseInt(computed.width, 10);
+  function resize() {
+    canvas.width = devicePixelRatio * innerWidth;
+    canvas.height = devicePixelRatio * innerHeight;
+    gl.viewport(0, 0, canvas.width, canvas.height);
 
-  canvas.width = 2 * devicePixelRatio * w;
-  canvas.height = 2 * devicePixelRatio * w;
-  gl.viewport(0, 0, canvas.width, canvas.height);
-
-  // Create chunks. Chunks won't be exactly 64x64, but will be as close to
-  // that as possible while perfectly dividing the available space.
-  const CHUNK_SIZE = 64;
-  const ROWS = Math.ceil(canvas.height / CHUNK_SIZE);
-  const COLUMNS = Math.ceil(canvas.width / CHUNK_SIZE);
-  numChunks = ROWS * COLUMNS;
-  const chunks = [];
-  const aspect = canvas.width / canvas.height;
-  for (let y = 0; y < ROWS; y++) {
-    for (let x = 0; x < COLUMNS; x++) {
-      const left = 2 * x / COLUMNS - 1;
-      const right = 2 * (x + 1) / COLUMNS - 1;
-      const top = 2 * y / ROWS - 1;
-      const bottom = 2 * (y + 1) / ROWS - 1;
-      const cx = aspect * (left + right) / 2, cy = (top + bottom) / 2;
-      const r2 = cx * cx + cy * cy;
-      chunks.push([
-        r2,
-        [
-          [left, top],
-          [left, bottom],
-          [right, top],
-          [right, bottom],
-        ],
-      ]);
+    // Create chunks. Chunks won't be exactly 64x64, but will be as close to
+    // that as possible while perfectly dividing the available space.
+    const CHUNK_SIZE = 64;
+    const ROWS = Math.ceil(canvas.height / CHUNK_SIZE);
+    const COLUMNS = Math.ceil(canvas.width / CHUNK_SIZE);
+    numChunks = ROWS * COLUMNS;
+    const chunks = [];
+    const aspect = canvas.width / canvas.height;
+    for (let y = 0; y < ROWS; y++) {
+      for (let x = 0; x < COLUMNS; x++) {
+        const left = 2 * x / COLUMNS - 1;
+        const right = 2 * (x + 1) / COLUMNS - 1;
+        const top = 2 * y / ROWS - 1;
+        const bottom = 2 * (y + 1) / ROWS - 1;
+        const cx = aspect * (left + right) / 2, cy = (top + bottom) / 2;
+        const r2 = cx * cx + cy * cy;
+        chunks.push([
+          r2,
+          [
+            [left, top],
+            [left, bottom],
+            [right, top],
+            [right, bottom],
+          ],
+        ]);
+      }
     }
+    // Sort chunks so that central ones are first.
+    chunks.sort((a, b) => a[0] - b[0]);
+    const fullScreen = [-1, -1, -1, 1, 1, -1, 1, 1];
+    const vertices =
+        new Float32Array([...chunks.map(a => a[1]).flat(2), ...fullScreen]);
+
+    // Upload the vertex data.
+    gl.bindBuffer(gl.ARRAY_BUFFER, chunkBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+    console.log(`numChunks=${numChunks}, vertices.length=${vertices.length}`);
+    restartDrawing();
   }
-  // Sort chunks so that central ones are first.
-  chunks.sort((a, b) => a[0] - b[0]);
-  const fullScreen = [-1, -1, -1, 1, 1, -1, 1, 1];
-  const vertices =
-      new Float32Array([...chunks.map(a => a[1]).flat(2), ...fullScreen]);
 
-  // Upload the vertex data.
-  gl.bindBuffer(gl.ARRAY_BUFFER, chunkBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
-  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-
-  console.log(`numChunks=${numChunks}, vertices.length=${vertices.length}`);
-  restartDrawing();
-
-  //addEventListener('resize', resize);
+  resize();
+  addEventListener('resize', resize);
 }
 
 main();

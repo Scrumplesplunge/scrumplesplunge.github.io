@@ -6,6 +6,4 @@ very cool, and that it could probably also be done quite efficiently with webgl
 shaders, so I recreated the same logic as a shader that you can experience
 directly in your browser.
 
-<canvas style="width: 100%"></canvas>
-<pre id=info></pre>
-<script src=script.js></script>
+<a href="render.html"><image src=render.png style="width: 100%"></a>
