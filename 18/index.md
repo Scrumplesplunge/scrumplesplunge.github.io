@@ -6,4 +6,4 @@ very cool, and that it could probably also be done quite efficiently with webgl
 shaders, so I recreated the same logic as a shader that you can experience
 directly in your browser.
 
-<a href="render.html"><image src=render.png style="width: 100%"></a>
+<a href="render.html"><image src=render.jpg style="width: 100%"></a>
