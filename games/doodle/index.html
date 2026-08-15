@@ -1,0 +1,824 @@
+<!doctype html>
+<meta charset=utf-8>
+<!-- user-scalable=no is required to prevent pinch zoom -->
+<meta name=viewport content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Draw</title>
+<style>
+html {
+  /* required to prevent refresh when overscrolling upwards */
+  touch-action: none;
+}
+canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+#tray {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 0.25cm;
+}
+#color, button {
+  border: 0;
+  width: 0.8cm;
+  height: 0.8cm;
+}
+button:hover {
+  transform: scale(1.1);
+}
+button:active {
+  transform: scale(1);
+}
+button.selected {
+  transform: scale(1.25);
+}
+#burger {
+  background: url('burger.png');
+  background-size: 100% 100%;
+}
+#move {
+  background: url('move.png');
+  background-size: 100% 100%;
+}
+#pencil {
+  background: url('pencil.png');
+  background-size: 100% 100%;
+}
+#tool-box {
+  padding: 0;
+  margin: 0;
+}
+#tool-box > li {
+  margin-top: 0.25cm;
+  list-style-type: none;
+}
+#status {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+}
+</style>
+<canvas></canvas>
+<div id=tray>
+  <button id=burger></button>
+  <ul id=tool-box hidden>
+    <li><input id=color type=color></li>
+    <li><button id=move></button></li>
+    <li><button id=pencil></button></li>
+  </ul>
+</div>
+<pre id=status></pre>
+<script>
+const statusBox = document.querySelector('#status');
+const canvas = document.querySelector('canvas');
+const gl = canvas.getContext('webgl2', {antialias: false});
+
+gl.enableVertexAttribArray(0);
+gl.disable(gl.DEPTH_TEST);
+gl.disable(gl.CULL_FACE);
+
+const vertices = new Float32Array([
+  -1, -1,
+  -1, 1,
+  1, -1,
+  1, 1,
+]);
+
+const buffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+// Value representing 1 in fixed precision.
+const ONE_SHIFT = 30;
+const ONE = 1 << ONE_SHIFT;
+
+// Zoom range. Higher zoom is higher magnification. Zoom 1 scales the image so
+// that it is as tall as the canvas.
+const MIN_ZOOM = 1;
+const MAX_ZOOM = 1000000;
+
+// Texture data will be stored in a SIZE * SIZE texture.
+const SIZE = 4096;
+
+// We will operate on chunks which are CHUNK_SIZE * CHUNK_SIZE.
+const CHUNK_SIZE = 2;
+const CHUNK_STRIDE = CHUNK_SIZE * CHUNK_SIZE;
+const LOG_CHUNK_SIZE = Math.log2(CHUNK_SIZE);
+const LOG_CHUNK_STRIDE = 2 * LOG_CHUNK_SIZE;
+
+if (SIZE % CHUNK_SIZE != 0) {
+  throw new Error("Chunk size does not divide size.");
+}
+if (SIZE % CHUNK_STRIDE != 0) {
+  throw new Error("Chunk stride does not divide size.");
+}
+
+// Number of chunks per row in the texture.
+const ROW_SIZE = SIZE / CHUNK_STRIDE;
+
+// Total number of chunks.
+const MAX_CHUNKS = SIZE * SIZE / CHUNK_STRIDE;
+
+// Magic number for save files.
+const VERSION = 2;
+const MAGIC = VERSION << 24 | 0x454f4a;  // I'm a narcissist.
+
+// These store 2d texture data for each chunk. Chunks are contiguous, so these
+// arrays acts as if they are ROW_SIZE * CHUNK_STRIDE wide, MAX_CHUNKS tall.
+const DEFAULT_CAPACITY = 1 << 16;
+let nodeCapacity = DEFAULT_CAPACITY;
+let pixelBuffer = new Uint16Array(nodeCapacity * CHUNK_STRIDE);
+let nodeBuffer = new Uint32Array(nodeCapacity * CHUNK_STRIDE);
+let numAllocated = 1;
+let nextNode = 0;
+let tool = '';
+const dirty = new Set();
+
+// Retrieve a specific chunk.
+function chunk(id) {
+  const start = CHUNK_STRIDE * id;
+  const end = start + CHUNK_STRIDE;
+  return {
+    pixels: pixelBuffer.subarray(start, end),
+    nodes: nodeBuffer.subarray(start, end),
+  };
+}
+
+function setChunk(id, data) {
+  chunk(id).pixels.set(data.pixels);
+  chunk(id).nodes.set(data.nodes);
+}
+
+// Compact the tree down to a contiguous prefix of each buffer, reserving space
+// for `extraCapacity` additional nodes at the end. The nodes are reordered into
+// breadth-first traversal order, which allows the save file format to represent
+// each node with only a bitmask of whether each entry is a child (1) or not (0)
+// and still correctly reconstruct the indices on load.
+function compact(extraCapacity) {
+  const start = Date.now();
+  const oldSize = nodeCapacity;
+  // Compact all allocated chunks.
+  const size = numAllocated + extraCapacity;
+  if (size > MAX_CHUNKS) throw new Error('Allocation is too large');
+  const compactPixels = new Uint16Array(size * CHUNK_STRIDE);
+  const compactNodes = new Uint32Array(size * CHUNK_STRIDE);
+  const queue = new Uint32Array(numAllocated);
+  queue[0] = 0;  // Start at the root (just to be explicit, it's a no-op).
+  let count = 1;  // queue[0] is 0 by default, which is the root.
+  for (let i = 0; i < count; i++) {
+    const {nodes, pixels} = chunk(queue[i]);
+    const a = i * CHUNK_STRIDE, b = a + CHUNK_STRIDE;
+    compactPixels.set(pixels, a);
+    const outNodes = compactNodes.subarray(a, b);
+    for (let j = 0; j < CHUNK_STRIDE; j++) {
+      if (nodes[j]) {
+        outNodes[j] = count;
+        queue[count] = nodes[j];
+        count++;
+      }
+    }
+  }
+  pixelBuffer = compactPixels;
+  nodeBuffer = compactNodes;
+  nodeCapacity = size;
+  uploadAll();
+  dirty.clear();
+  nextNode = 0;
+  const end = Date.now();
+  console.log(`Compacted ${oldSize} -> ${numAllocated}` +
+              (extraCapacity ? ` + ${extraCapacity}` : '') +
+              ` in ${end - start}ms`);
+}
+
+// Save the buffers to a save file.
+async function save() {
+  // We still reserve DEFAULT_CAPACITY additional space in case the user wants
+  // to keep drawing after saving.
+  compact(Math.min(MAX_CHUNKS - numAllocated, DEFAULT_CAPACITY));
+
+  // Combine and compress the buffers.
+  const header = new Uint32Array([MAGIC, numAllocated]);
+  const pixels = pixelBuffer.subarray(0, numAllocated * CHUNK_STRIDE);
+  if (CHUNK_SIZE != 2) {
+    throw new Error('Saving code is needs updating for different chunk sizes.');
+  }
+  const nodes = new Uint8Array(Math.ceil(numAllocated / 2));
+  for (let i = 0; i < numAllocated; i++) {
+    const {nodes: chunkNodes} = chunk(i);
+    const bits = !!chunkNodes[0] | !!chunkNodes[1] << 1 |
+                 !!chunkNodes[2] << 2 | !!chunkNodes[3] << 3;
+    nodes[Math.floor(i / 2)] |= bits << (i % 2 * 4);
+  }
+  const uncompressed = new Blob([header, pixels, nodes]);
+  console.log(`Uncompressed size: ${uncompressed.size}`);
+  const stream = uncompressed
+      .stream()
+      .pipeThrough(new CompressionStream('gzip'));
+  const contents = await new Response(stream).blob();
+  console.log(`Compressed size: ${contents.size}`);
+
+  // Prompt the user to pick a save location.
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(contents);
+  a.download = 'image.bin';
+  a.click();
+}
+
+async function load(byteStream) {
+  // Decompress the file.
+  const stream = byteStream.pipeThrough(new DecompressionStream('gzip'));
+  const contents =
+      await (await (new Response(stream)).blob()).arrayBuffer();
+  console.log(`Uncompressed size: ${contents.byteLength}`);
+  const header = new Uint32Array(contents, 0, 2);
+  if (header[0] != MAGIC) throw new Error('Incompatible file');
+  numAllocated = header[1];
+  const pixelStart = header.byteLength;
+  const nodeStart = pixelStart + 2 * CHUNK_STRIDE * numAllocated;
+  pixelBuffer = new Uint16Array(contents, pixelStart,
+                                CHUNK_STRIDE * numAllocated);
+  const nodeBits =
+      new Uint8Array(contents, nodeStart, Math.ceil(numAllocated / 2));
+  nodeBuffer = new Uint32Array(CHUNK_STRIDE * numAllocated);
+  let id = 1;
+  if (CHUNK_STRIDE != 4) {
+    throw new Error('Loading code only supports CHUNK_STRIDE=4');
+  }
+  for (let i = 0; i < numAllocated; i++) {
+    let nodes = chunk(i).nodes;
+    const bits = nodeBits[i >> 1] >> (i % 2 * 4);
+    for (let j = 0; j < 4; j++) {
+      if (bits & (1 << j)) nodes[j] = id++;
+    }
+  }
+  if (id != numAllocated) throw new Error('Node data is corrupted');
+  nodeCapacity = numAllocated;
+  nextNode = 0;
+  uploadAll();
+  dirty.clear();
+  draw();
+}
+
+function loadFile() {
+  return new Promise((resolve, reject) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.addEventListener('change', async (event) => {
+      if (event.target.files.length != 1) return;
+      const file = event.target.files[0];
+
+      // Decompress the file.
+      await load(file.stream());
+      resolve();
+    });
+    input.click();
+  });
+}
+
+// Create the texture buffers. These will store copies of the data from
+// `pixelBuffer` and `nodeBuffer`, except that the order of data is different.
+// While the buffers store each chunk contiguously, the textures store chunks in
+// a 2D grid (so rows of the chunks are interleaved).
+const pixelTexture = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, pixelTexture);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, SIZE, SIZE, 0, gl.RGB,
+              gl.UNSIGNED_SHORT_5_6_5, new Uint16Array(SIZE * SIZE));
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+const nodeTexture = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, nodeTexture);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32UI, SIZE, SIZE, 0, gl.RED_INTEGER,
+              gl.UNSIGNED_INT, new Uint32Array(SIZE * SIZE));
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+// Upload a specific chunk.
+function upload(id) {
+  const {pixels, nodes} = chunk(id);
+  const x = id % ROW_SIZE * CHUNK_STRIDE;
+  const y = Math.floor(id / ROW_SIZE);
+  gl.bindTexture(gl.TEXTURE_2D, pixelTexture);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, CHUNK_STRIDE, 1, gl.RGB,
+                   gl.UNSIGNED_SHORT_5_6_5, pixels);
+  gl.bindTexture(gl.TEXTURE_2D, nodeTexture);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, CHUNK_STRIDE, 1,
+                   gl.RED_INTEGER, gl.UNSIGNED_INT, nodes);
+}
+
+function uploadAll() {
+  const x = Math.min(nodeCapacity, ROW_SIZE) * CHUNK_STRIDE;
+  const y = Math.floor(nodeCapacity / ROW_SIZE);
+  // We need to upload the last row separately.
+  gl.bindTexture(gl.TEXTURE_2D, pixelTexture);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, x, y, gl.RGB,
+                   gl.UNSIGNED_SHORT_5_6_5, pixelBuffer);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, y,
+                   nodeCapacity % ROW_SIZE * CHUNK_STRIDE, 1, gl.RGB,
+                   gl.UNSIGNED_SHORT_5_6_5, pixelBuffer.subarray(y * SIZE));
+  gl.bindTexture(gl.TEXTURE_2D, nodeTexture);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, x, y, gl.RED_INTEGER,
+                   gl.UNSIGNED_INT, nodeBuffer);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, y,
+                   nodeCapacity % ROW_SIZE * CHUNK_STRIDE, 1, gl.RED_INTEGER,
+                   gl.UNSIGNED_INT, nodeBuffer.subarray(y * SIZE));
+}
+
+// Fill the root node with white.
+const root = chunk(0);
+for (let y = 0; y < CHUNK_SIZE; y++) {
+  for (let x = 0; x < CHUNK_SIZE; x++) {
+    root.pixels[y * CHUNK_SIZE + x] = 0xFFFF;
+  }
+}
+upload(0);
+
+const vs = gl.createShader(gl.VERTEX_SHADER);
+gl.shaderSource(vs, `#version 300 es
+
+precision mediump float;
+
+layout(location = 0) in vec2 vertex;
+
+void main() {
+  gl_Position = vec4(vertex, 0, 1);
+}
+`);
+gl.compileShader(vs);
+if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+  throw new Error(`Vertex shader compile error: ${gl.getShaderInfoLog(vs)}`);
+}
+const fs = gl.createShader(gl.FRAGMENT_SHADER);
+gl.shaderSource(fs, `#version 300 es
+
+precision highp float;
+precision highp int;
+
+layout(location = 0) out lowp vec4 color;
+
+uniform bool debug;
+uniform uvec2 center;
+uniform ivec2 position;
+uniform int scale;
+
+uniform sampler2D pixels;
+uniform highp usampler2D nodes;
+
+const int CHUNK_SIZE = ${CHUNK_SIZE};
+const uint CHUNK_STRIDE = ${CHUNK_STRIDE}u;
+const uint LOG_CHUNK_SIZE = ${LOG_CHUNK_SIZE}u;
+const uint STEPS = ${ONE_SHIFT}u / LOG_CHUNK_SIZE;
+const uint MAX_SHIFT = ${ONE_SHIFT}u - LOG_CHUNK_SIZE;
+
+vec4 find(ivec2 pos) {
+  if (pos.x < 0 || pos.x >= ${ONE} || pos.y < 0 || pos.y >= ${ONE}) {
+    return vec4(0.5, 0.5, 0.5, 1);
+  }
+  uint node = 0u;
+  uint i = 0u;
+  int view_size = ${ONE};
+  while (true) {
+    view_size >>= LOG_CHUNK_SIZE;
+    int local_index = CHUNK_SIZE * (pos.y >> MAX_SHIFT) + (pos.x >> MAX_SHIFT);
+    ivec2 lookup_index = ivec2(
+        int(node % ${ROW_SIZE}u * CHUNK_STRIDE) + local_index,
+        int(node / ${ROW_SIZE}u));
+    uint next = texelFetch(nodes, lookup_index, 0).r;
+    if (next == 0u || view_size <= 2 * scale) {
+      if (debug) {
+        return vec4(vec3(1, 1, 1) * float(i) / float(STEPS), 1);
+      } else {
+        return texelFetch(pixels, lookup_index, 0);
+      }
+    } else {
+      node = next;
+      pos = (pos << LOG_CHUNK_SIZE) & (${ONE} - 1);
+    }
+    i++;
+  }
+}
+
+void main() {
+  ivec2 pixel = ivec2(uint(gl_FragCoord.x) - center.x,
+                      center.y - uint(gl_FragCoord.y));
+  color = find(position + pixel * scale);
+}
+`);
+gl.compileShader(fs);
+if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+  throw new Error(`Fragment shader compile error: ${gl.getShaderInfoLog(fs)}`);
+};
+
+const program = gl.createProgram();
+gl.attachShader(program, vs);
+gl.attachShader(program, fs);
+gl.linkProgram(program);
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+  throw new Error(`Link error: ${gl.getProgramInfoLog(program)}`);
+}
+gl.useProgram(program);
+
+const position = {x: 1 << 29, y: 1 << 29};
+let focus = {x: 0, y: 0};
+let zoom = 100;
+let debug = false;
+
+function getScale() {
+  return Math.ceil((1 << 30) / canvas.height / zoom);
+}
+
+function fromScreen(x, y) {
+  x = Math.floor((x - innerWidth / 2) * devicePixelRatio);
+  y = Math.floor((y - innerHeight / 2) * devicePixelRatio);
+  const scale = getScale();
+  return {
+    x: position.x + x * scale,
+    y: position.y + y * scale,
+  };
+}
+
+let nextDraw = 0;
+let drawTimer = 0;
+const DRAW_DELAY = 20;
+
+function draw() {
+  const now = Date.now();
+  nextDraw = now + DRAW_DELAY;
+  drawTimer = 0;
+
+  // Upload all dirty (modified) nodes. We do this once when drawing to avoid
+  // repeatedly uploading nodes which get overwritten before the next draw.
+  if (dirty.size > 1000) {
+    // If we have a large number of dirty nodes, the overhead of so many calls
+    // to `upload` becomes high and it is faster to simply re-upload
+    // the entire buffer with one call.
+    const start = Date.now();
+    uploadAll();
+    const end = Date.now();
+    if (end - start >= 5) console.log(`Bulk upload in ${end - start}ms`);
+  } else {
+    const start = Date.now();
+    for (const node of dirty) upload(node);
+    const end = Date.now();
+    if (end - start >= 5) {
+      console.log(`${dirty.size} individual uploads in ${end - start}ms`);
+    }
+  }
+  dirty.clear();
+
+  // Drawing is very simple at this level: we are simply rendering a single
+  // rectangle. All the logic for traversing the tree is handled by the fragment
+  // shader.
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, pixelTexture);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, nodeTexture);
+  gl.uniform2ui(gl.getUniformLocation(program, 'center'),
+                Math.floor(canvas.width / 2), Math.floor(canvas.height / 2));
+  gl.uniform2i(gl.getUniformLocation(program, 'position'),
+               position.x, position.y);
+  gl.uniform1i(gl.getUniformLocation(program, 'scale'), getScale());
+  gl.uniform1i(gl.getUniformLocation(program, 'debug'), debug);
+  gl.uniform1i(gl.getUniformLocation(program, 'pixels'), 0);
+  gl.uniform1i(gl.getUniformLocation(program, 'nodes'), 1);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+// Request that the screen be repainted soon. This clamps the maximum rate of
+// repainting while still allowing us to only redraw on demand.
+function tryDraw() {
+  const now = Date.now();
+  if (drawTimer == 0) {
+    drawTimer = setTimeout(draw, Math.max(0, nextDraw - now));
+  }
+}
+
+function resize() {
+  canvas.width = devicePixelRatio * innerWidth;
+  canvas.height = devicePixelRatio * innerHeight;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  tryDraw();
+}
+resize();
+addEventListener('resize', resize);
+
+const hover = {x: 0, y: 0};
+
+function allocateUninitialized() {
+  if (nextNode != 0) {
+    // Allocate the node from the free list.
+    const index = nextNode;
+    const {nodes, pixels} = chunk(index);
+    nextNode = nodes[0];
+    numAllocated++;
+    return index;
+  } else if (numAllocated < nodeCapacity) {
+    // Allocate the next available node from the reserved capacity.
+    return numAllocated++;
+  } else if (nodeCapacity < MAX_CHUNKS) {
+    // Grow the capacity.
+    nodeCapacity = Math.min(MAX_CHUNKS, 2 * nodeCapacity);
+    const newPixelBuffer = new Uint16Array(nodeCapacity * CHUNK_STRIDE);
+    newPixelBuffer.set(pixelBuffer);
+    const newNodeBuffer = new Uint32Array(nodeCapacity * CHUNK_STRIDE);
+    newNodeBuffer.set(nodeBuffer);
+    pixelBuffer = newPixelBuffer;
+    nodeBuffer = newNodeBuffer;
+    return numAllocated++;
+  } else {
+    throw new Error('Out of nodes');
+  }
+}
+
+function allocateNode(color) {
+  const node = allocateUninitialized();
+  const {nodes, pixels} = chunk(node);
+  for (let y = 0; y < CHUNK_SIZE; y++) {
+    for (let x = 0; x < CHUNK_SIZE; x++) {
+      nodes[y * CHUNK_SIZE + x] = 0;
+      pixels[y * CHUNK_SIZE + x] = color;
+    }
+  }
+  return node;
+}
+
+function deallocateNode(node) {
+  const {nodes} = chunk(node);
+  for (let y = 0; y < CHUNK_SIZE; y++) {
+    for (let x = 0; x < CHUNK_SIZE; x++) {
+      const i = y * CHUNK_SIZE + x;
+      if (nodes[i]) deallocateNode(nodes[i]);
+    }
+  }
+  nodes[0] = nextNode;
+  numAllocated--;
+  nextNode = node;
+}
+
+// Fill an implicit polygon described by the array `edges`, clipped to `node`.
+// Each element of `edges` is an object `{x, y, d}` where `n = {x, y}` is the
+// normal of the edge and `d = n.dot(v)` for all points `v` on the line
+// containing the edge.
+//
+// `nodePos` and `nodeSize` are the size of `node`, scaled so that the root node
+// has size `ONE`. `unitSize` is minimum node size where we will recurse to
+// partially fill a cell instead of simply overwriting the entire thing with one
+// color.
+//
+// The return value is the average colour of `node` after the change.
+function fillPolyRec(node, edges, nodePos, nodeSize, unitSize, color, depth) {
+  nodeSize /= CHUNK_SIZE;
+  const {nodes, pixels} = chunk(node);
+  for (let y = 0; y < CHUNK_SIZE; y++) {
+    for (let x = 0; x < CHUNK_SIZE; x++) {
+      const i = y * CHUNK_SIZE + x;
+      let allOutside = false;
+      for (const edge of edges) {
+        const vx = nodePos.x + (edge.x < 0 ? x + 1 : x) * nodeSize;
+        const vy = nodePos.y + (edge.y < 0 ? y + 1 : y) * nodeSize;
+        if (edge.x * vx + edge.y * vy > edge.d) {
+          allOutside = true;
+          break;
+        }
+      }
+      if (allOutside) continue;
+      const partialEdges = [];
+      for (const edge of edges) {
+        const vx = nodePos.x + (edge.x < 0 ? x : x + 1) * nodeSize;
+        const vy = nodePos.y + (edge.y < 0 ? y : y + 1) * nodeSize;
+        if (edge.x * vx + edge.y * vy > edge.d) partialEdges.push(edge);
+      }
+      if (partialEdges.length == 0 || nodeSize < unitSize) {
+        // Fill the entire cell.
+        if (nodes[i]) deallocateNode(nodes[i]);
+        nodes[i] = 0;
+        pixels[i] = color;
+      } else {
+        // Recursively fill part of the cell.
+        if (!nodes[i]) nodes[i] = allocateNode(pixels[i]);
+        pixels[i] = fillPolyRec(
+            nodes[i], partialEdges,
+            {x: nodePos.x + x * nodeSize, y: nodePos.y + y * nodeSize},
+            nodeSize, unitSize, color, depth + 1);
+      }
+    }
+  }
+  // This looks like a redundant assignment, but it's not: a call to
+  // `allocateNode` in the loop above may have triggered the entire buffer to be
+  // reallocated, in which case we may have not written all changes to the new
+  // buffer.
+  setChunk(node, {nodes, pixels});
+  dirty.add(node);
+
+  // Compute the average colour of all pixels in this node. The colour data is
+  // stored as RGB_5_6_5, so we need to carefully mask and shift the components.
+  let r = 0, g = 0, b = 0;
+  for (const pixel of pixels) {
+    r += pixel >> 11;
+    g += (pixel >> 5) & 0x3F;
+    b += pixel & 0x1F;
+  }
+  r >>= LOG_CHUNK_STRIDE;
+  g >>= LOG_CHUNK_STRIDE;
+  b >>= LOG_CHUNK_STRIDE;
+  return r << 11 | g << 5 | b;
+}
+
+const circle = [];
+const CIRCLE_SIDES = 64;
+for (let i = 0; i < CIRCLE_SIDES; i++) {
+  const theta = 2 * Math.PI * i / CIRCLE_SIDES;
+  const x = Math.cos(theta), y = Math.sin(theta);
+  circle.push({x, y});
+}
+
+function fillCircle(position, radius, color) {
+  const edges = [];
+  for (const {x, y} of circle) {
+    const d = radius + position.x * x + position.y * y;
+    edges.push({x, y, d});
+  }
+  fillPolyRec(0, edges, {x: 0, y: 0}, ONE, 4 * getScale(), color, 0);
+}
+
+function fillLine(a, b, radius, color) {
+  const n = {x: a.y - b.y, y: b.x - a.x};
+  const length = Math.sqrt(n.x * n.x + n.y * n.y);
+  n.x /= length;
+  n.y /= length;
+  const edges = [
+      {x: n.x, y: n.y, d: radius + a.x * n.x + a.y * n.y},
+      {x: -n.x, y: -n.y, d: radius - a.x * n.x - a.y * n.y},
+  ];
+  for (const {x, y} of circle.filter((x, i) => i % 4 == 0)) {
+    const d1 = a.x * x + a.y * y;
+    const d2 = b.x * x + b.y * y;
+    const d = radius + Math.max(d1, d2);
+    edges.push({x, y, d});
+  }
+  fillPolyRec(0, edges, {x: 0, y: 0}, ONE, 4 * getScale(), color, 0);
+}
+
+let penSize = 3;
+let penColor = 0;
+const pointers = new Map();
+
+canvas.addEventListener('pointerdown', event => {
+  const pointer = {tool: event.button == 2 ? 'move' : tool,
+                   x: event.x, y: event.y, id: event.pointerId};
+  pointers.set(event.pointerId, pointer);
+  switch (pointer.tool) {
+    case 'pencil':
+      const pos = fromScreen(event.x, event.y);
+      fillCircle(pos, penSize * getScale(), penColor);
+      tryDraw();
+      break;
+    case 'move':
+      pointer.focus = fromScreen(event.x, event.y);
+      break;
+  }
+});
+
+canvas.addEventListener('pointerup', event => {
+  pointers.delete(event.pointerId);
+});
+
+canvas.addEventListener('pointercancel', event => {
+  pointers.delete(event.pointerId);
+});
+
+canvas.addEventListener('pointermove', event => {
+  hover.x = event.x;
+  hover.y = event.y;
+  // Don't bother trying to interpret what the user means if they're
+  // dual-wielding tools. That's too advanced for us.
+  const tools = new Set([...pointers.values()].map(x => x.tool));
+  if (tools.size > 1) return;
+  const pointer = pointers.get(event.pointerId);
+  if (!pointer) return;
+  switch (pointer.tool) {
+    case 'pencil':
+      const a = fromScreen(pointer.x, pointer.y);
+      const b = fromScreen(event.x, event.y);
+      pointer.x = event.x;
+      pointer.y = event.y;
+      fillLine(a, b, penSize * getScale(), penColor);
+      tryDraw();
+      break;
+    case 'move':
+      switch (pointers.size) {
+        case 1:
+          // We're dragging with one finger.
+          pointer.x = event.x;
+          pointer.y = event.y;
+          const current = fromScreen(pointer.x, pointer.y);
+          position.x += pointer.focus.x - current.x;
+          position.y += pointer.focus.y - current.y;
+          tryDraw();
+          break;
+        case 2:
+          // We're pinching or zooming.
+          const [a, b] = pointers.values();
+          const pointer2 = pointer == a ? b : a;
+          const oldOffset =
+              {x: pointer2.x - pointer.x, y: pointer2.y - pointer.y};
+          const oldCenter = {x: pointer.x + 0.5 * oldOffset.x,
+                             y: pointer.y + 0.5 * oldOffset.y};
+          const oldDistance = Math.sqrt(oldOffset.x**2 + oldOffset.y**2);
+          pointer.x = event.x;
+          pointer.y = event.y;
+          const newOffset =
+              {x: pointer2.x - pointer.x, y: pointer2.y - pointer.y};
+          const newCenter = {x: pointer.x + 0.5 * newOffset.x,
+                             y: pointer.y + 0.5 * newOffset.y};
+          const newDistance = Math.sqrt(newOffset.x**2 + newOffset.y**2);
+          const factor = newDistance / oldDistance;
+          const before = fromScreen(oldCenter.x, oldCenter.y);
+          zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * factor));
+          const after = fromScreen(newCenter.x, newCenter.y);
+          position.x += before.x - after.x;
+          position.y += before.y - after.y;
+          pointer.focus = fromScreen(pointer.x, pointer.y);
+          pointer2.focus = fromScreen(pointer2.x, pointer2.y);
+          tryDraw();
+          break;
+      }
+      break;
+  }
+});
+
+addEventListener('contextmenu', event => event.preventDefault());
+
+addEventListener('wheel', event => {
+  const scale = Math.pow(2, -event.deltaY / 1000);
+  const before = fromScreen(hover.x, hover.y);
+  zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * scale));
+  const after = fromScreen(hover.x, hover.y);
+  position.x += before.x - after.x;
+  position.y += before.y - after.y;
+  tryDraw();
+});
+
+addEventListener('keydown', async (event) => {
+  switch (event.key) {
+    case 'S':
+      await save();
+      break;
+    case 'L':
+      await loadFile();
+      break;
+    case '?':
+      debug = !debug;
+      tryDraw();
+  }
+});
+
+// Allow the tool menu to be opened and closed.
+const burger = document.querySelector('#burger');
+const toolBox = document.querySelector('#tool-box');
+burger.addEventListener('click', event => {
+  toolBox.hidden = !toolBox.hidden;
+});
+
+// Update the pen color based on the user's selection.
+const color = document.querySelector('#color');
+color.addEventListener('change', event => {
+  const hex = color.value;
+  const r = parseInt(hex.substr(1, 2), 16) >> 3;
+  const g = parseInt(hex.substr(3, 2), 16) >> 2;
+  const b = parseInt(hex.substr(5, 2), 16) >> 3;
+  penColor = r << 11 | g << 5 | b;
+});
+
+const tools = {
+  move: document.querySelector('#move'),
+  pencil: document.querySelector('#pencil'),
+};
+tools.move.addEventListener('click', event => pickTool('move'));
+tools.pencil.addEventListener('click', event => pickTool('pencil'));
+
+function pickTool(x) {
+  for (const tool of Object.values(tools)) {
+    tool.classList.remove('selected');
+  }
+  tool = x;
+  tools[tool].classList.add('selected');
+}
+
+pickTool('pencil');
+
+async function loadTrain() {
+  const response = await fetch('train.bin');
+  await load((await response.blob()).stream());
+  pickTool('move');
+}
+if (location.search == '?train') loadTrain();
+
+</script>
