@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1">
+<meta name=created content="2026-08-15T11:47:11Z">
+<meta name=keywords content="javascript, coding">
+<link id=theme rel=stylesheet href=/themes/default.css>
+<script>
+// Take a look in /themes if you want to pick a different one.
+document.getElementById("theme").href =
+    localStorage.theme || "/themes/default.css";
+</script>
+<title>Interference patterns</title>
+<header id=header>
+<h1><a href=/18>Interference patterns</a></h1>
+<time datetime="2026-08-15T11:47:11Z">Saturday 15th August 2026 at 12:47 IST</time>
+<p>
+<a class=previous title="Gilbert-Johnson-Keerth (GJK) and the Expanding Polytope Algorithm (EPA)" class=previous href="/17">← Previous</a>
+
+<br style="clear: both">
+</p>
+</header>
+<p>My colleague showed me a cool C++ project that he made for simulating the
+constructive and destructive interference of light passing through the aperture
+of a telescope, which can be used to accurately recreate the shape of the
+twinkling stars in photographs taken by different telescopes. I thought it was
+very cool, and that it could probably also be done quite efficiently with webgl
+shaders, so I recreated the same logic as a shader that you can experience
+directly in your browser.</p>
+
+<p><canvas style="width: 100%"></canvas></p>
+
+<pre id=info></pre>
+
+
+<script src=script.js></script>
